@@ -1,70 +1,6 @@
 """
-tinybuf - 精简版二进制序列化协议编解码器 (v4)
+tinybuf - 精简版二进制序列化协议编解码器 (v5)
 ===============================================
-
-线格式 (Wire Format) 设计
--------------------------
-每个字段在线上由两部分组成:
-  [Tag] [Value]
-
-  Tag = (field_number << 3) | wire_type
-  Tag 本身用 varint 编码, 因此小字段号(1-15)只需 1 字节。
-
-  Wire Type:
-    0 = VARINT   — int32, int64, uint32, uint64, sint32, sint64, bool, enum
-    1 = FIXED64  — 固定 8 字节
-    2 = LEN      — string, bytes, 嵌套消息, packed重复数值字段, map entry
-    5 = FIXED32  — 固定 4 字节
-
-Packed 编码
------------
-对 repeated 的 VARINT/FIXED32/FIXED64 字段, 可把一组元素合并成一个
-LEN 块 (wire_type=2): 先 varint 写出总字节长度, 再依次把所有元素的
-编码拼在一起。解码器读一个长度 L 后, 在 L 字节的子缓冲里循环解码直到耗尽。
-这样就省去了 N 个重复 Tag 的开销。解码端同时接受 "普通重复 (各自带Tag)"
-和 "packed (一个LEN块)" 两种写法, 实现上把这两种 wire_type 都导向同一字段。
-
-Map 字段
---------
-map<K,V> 在编码时等价于 repeated Message { K key=1; V value=2; },
-每个 entry 是一个独立的 LEN 字段。解码器把所有 entry 还原成一个 dict。
-老版本 decoder 看到这个字段号但没定义 map 时, 会按嵌套消息跳过,
-不影响向前兼容。
-
-Oneof 字段
-----------
-oneof { ... } 声明一组互斥的字段, 编码时只允许其中一个有值。
-解码时若数据流里出现多个 oneof 字段 (例如旧版本数据混发),
-保留最后一次出现的值 ("最后写入者胜"), 与 protobuf 一致。
-
-Required / Optional & Has Field
--------------------------------
-required 字段: encode 之前如果未填充, 抛出 RequiredFieldError。
-optional 字段: 解码后能区分 "没出现" 和 "出现了但等于默认值"。
-通过 has_field(name) / _fields_present set 追踪。
-
-Varint 编码原理
----------------
-每个字节的最高位 (MSB, bit 7) 是 "续接标志":
-  - 1 = 后面还有更多字节
-  - 0 = 这是最后一个字节
-低 7 位承载实际数据, 小端序排列 (little-endian group)。
-
-ZigZag 编码原理
----------------
-把有符号整数映射到无符号整数, 使绝对值小的数 (无论正负)
-都映射到小的无符号值, 从而 varint 编码紧凑。
-
-字段标签与向前兼容
------------------
-解码时先读 Tag (varint), 从中提取 wire_type 和 field_number。
-若 field_number 在当前 schema 中未知, 只需根据 wire_type 跳过
-固定长度即可 → 向前兼容。
-
-嵌套消息的长度界定
------------------
-嵌套消息 wire_type = LEN (2), Value 部分先 varint 写出字节长度 L,
-再跟 L 字节的子消息体。解码器在子缓冲上递归解码。
 """
 
 from __future__ import annotations
@@ -97,44 +33,21 @@ _WIRE_NAME = {
 # 自定义异常
 # ---------------------------------------------------------------------------
 
-class DecodeError(Exception):
-    """tinybuf 解码错误基类。"""
-
-
-class TruncatedDataError(DecodeError):
-    """字节流在字符串/bytes/嵌套消息/fixed字段/varint中间被截断。"""
-
-
-class VarintOverflowError(DecodeError):
-    """varint 超过 64 位, 或字段整数超过声明类型的位宽。"""
-
-
-class WireTypeMismatchError(DecodeError):
-    """Tag 声明的 wire_type 与该字段能接受的类型不符。"""
-
-
-class SchemaError(Exception):
-    """schema 定义错误 (字段号冲突、遗漏参数等)。"""
-
-
-class EncodeError(Exception):
-    """encode 时的业务校验错误基类。"""
-
-
-class RequiredFieldError(EncodeError):
-    """encode 时 required 字段缺失。"""
-
-
-class OneofConflictError(EncodeError):
-    """encode 时同一 oneof 组中同时设置了多个字段。"""
+class DecodeError(Exception): pass
+class TruncatedDataError(DecodeError): pass
+class VarintOverflowError(DecodeError): pass
+class WireTypeMismatchError(DecodeError): pass
+class SchemaError(Exception): pass
+class EncodeError(Exception): pass
+class RequiredFieldError(EncodeError): pass
+class OneofConflictError(EncodeError): pass
 
 
 class CompatLevel(IntEnum):
-    """两个 schema 版本之间的兼容性等级。"""
-    FULLY_COMPATIBLE = 0  # 无任何破坏性改动
-    SAFE_EXTENSION = 1    # 仅新增字段 (安全)
-    WARNING = 2           # 有破坏性但不致命 (如 optional 互改)
-    BREAKING = 3          # 破坏性改动 (号/类型改了, 删除了 required)
+    FULLY_COMPATIBLE = 0
+    SAFE_EXTENSION = 1
+    WARNING = 2
+    BREAKING = 3
 
 
 # ---------------------------------------------------------------------------
@@ -142,51 +55,29 @@ class CompatLevel(IntEnum):
 # ---------------------------------------------------------------------------
 
 class FieldType(IntEnum):
-    INT32 = 0
-    INT64 = 1
-    UINT32 = 2
-    UINT64 = 3
-    SINT32 = 4
-    SINT64 = 5
-    BOOL = 6
-    STRING = 7
-    BYTES = 8
-    MESSAGE = 9
-    FIXED32 = 10
-    FIXED64 = 11
+    INT32 = 0; INT64 = 1; UINT32 = 2; UINT64 = 3
+    SINT32 = 4; SINT64 = 5; BOOL = 6; STRING = 7; BYTES = 8
+    MESSAGE = 9; FIXED32 = 10; FIXED64 = 11
 
 
 _WIRE_MAP: Dict[FieldType, int] = {
-    FieldType.INT32: WIRE_VARINT,
-    FieldType.INT64: WIRE_VARINT,
-    FieldType.UINT32: WIRE_VARINT,
-    FieldType.UINT64: WIRE_VARINT,
-    FieldType.SINT32: WIRE_VARINT,
-    FieldType.SINT64: WIRE_VARINT,
+    FieldType.INT32: WIRE_VARINT, FieldType.INT64: WIRE_VARINT,
+    FieldType.UINT32: WIRE_VARINT, FieldType.UINT64: WIRE_VARINT,
+    FieldType.SINT32: WIRE_VARINT, FieldType.SINT64: WIRE_VARINT,
     FieldType.BOOL: WIRE_VARINT,
-    FieldType.STRING: WIRE_LEN,
-    FieldType.BYTES: WIRE_LEN,
+    FieldType.STRING: WIRE_LEN, FieldType.BYTES: WIRE_LEN,
     FieldType.MESSAGE: WIRE_LEN,
-    FieldType.FIXED32: WIRE_FIXED32,
-    FieldType.FIXED64: WIRE_FIXED64,
+    FieldType.FIXED32: WIRE_FIXED32, FieldType.FIXED64: WIRE_FIXED64,
 }
 
-_PACKABLE = {
-    FieldType.INT32, FieldType.INT64,
-    FieldType.UINT32, FieldType.UINT64,
-    FieldType.SINT32, FieldType.SINT64,
-    FieldType.BOOL,
-    FieldType.FIXED32, FieldType.FIXED64,
-}
+_PACKABLE = {FieldType.INT32, FieldType.INT64, FieldType.UINT32, FieldType.UINT64,
+             FieldType.SINT32, FieldType.SINT64, FieldType.BOOL,
+             FieldType.FIXED32, FieldType.FIXED64}
 
-_MAP_KEY_TYPES = {
-    FieldType.INT32, FieldType.INT64,
-    FieldType.UINT32, FieldType.UINT64,
-    FieldType.SINT32, FieldType.SINT64,
-    FieldType.BOOL,
-    FieldType.STRING,
-    FieldType.FIXED32, FieldType.FIXED64,
-}
+_MAP_KEY_TYPES = {FieldType.INT32, FieldType.INT64, FieldType.UINT32,
+                  FieldType.UINT64, FieldType.SINT32, FieldType.SINT64,
+                  FieldType.BOOL, FieldType.STRING,
+                  FieldType.FIXED32, FieldType.FIXED64}
 
 _MAX_VARINT_BYTES = 10
 
@@ -261,10 +152,6 @@ def zigzag_decode(value: int, bits: int = 64) -> int:
     return half
 
 
-# ---------------------------------------------------------------------------
-# Tag
-# ---------------------------------------------------------------------------
-
 def make_tag(field_number: int, wire_type: int) -> int:
     if field_number < 1:
         raise SchemaError(f"Field number must be >= 1, got {field_number}")
@@ -274,10 +161,6 @@ def make_tag(field_number: int, wire_type: int) -> int:
 def parse_tag(tag: int) -> Tuple[int, int]:
     return tag >> 3, tag & 0x07
 
-
-# ---------------------------------------------------------------------------
-# 有符号/无符号按位宽转换
-# ---------------------------------------------------------------------------
 
 def _to_signed(value: int, bits: int) -> int:
     if bits <= 0:
@@ -294,7 +177,7 @@ def _to_unsigned(value: int, bits: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# _FieldSpec / Field / OneofSpec / Oneof
+# _FieldSpec / Field / _OneofSpec
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -313,26 +196,14 @@ class _FieldSpec:
 
 
 class Field:
-    """
-    在类体中声明字段的描述符。示例::
-
-        @msg_schema
-        class Person(Message):
-            id = Field(1, FieldType.UINT32, required=True)
-            scores = Field(9, FieldType.INT32, repeated=True, packed=True)
-            attributes = Field(10, map=(FieldType.STRING, FieldType.INT32))
-    """
-
     __slots__ = ("_spec",)
 
     def __init__(self, number: int, field_type: Optional[FieldType] = None,
-                 repeated: bool = False,
-                 packed: bool = False,
+                 repeated: bool = False, packed: bool = False,
                  message_cls: Optional[Type["Message"]] = None,
                  map: Optional[Tuple[FieldType, FieldType]] = None,
                  value_message_cls: Optional[Type["Message"]] = None,
-                 required: bool = False,
-                 oneof: Optional[str] = None):
+                 required: bool = False, oneof: Optional[str] = None):
         if map is not None:
             if field_type is not None:
                 raise SchemaError("Cannot specify both field_type= and map=")
@@ -371,9 +242,6 @@ class Field:
                 raise SchemaError(
                     f"Field #{number}: repeated fields cannot be inside oneof"
                 )
-            if field_type == FieldType.MESSAGE and oneof:
-                # oneof message 是允许的 (protobuf 也支持)
-                pass
             self._spec = _FieldSpec(
                 number=number, field_type=field_type,
                 repeated=repeated, packed=packed,
@@ -442,27 +310,53 @@ class Message:
     _field_by_name: Dict[str, FieldDescriptor] = {}
     _oneofs: Dict[str, _OneofSpec] = {}
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        cls = self.__class__
+        if name in cls._field_by_name and hasattr(self, "_fields_present"):
+            desc = cls._field_by_name[name]
+            if not desc.is_map and not desc.repeated:
+                if desc.oneof:
+                    self._clear_oneof_branches(desc.oneof, keep_name=name)
+                self._fields_present.add(name)
+        object.__setattr__(self, name, value)
+
     def __init__(self, **kwargs: Any):
         self._fields_present: Set[str] = set()
 
         for desc in self.__class__._field_descriptors.values():
             if desc.is_map:
                 value = dict(kwargs.get(desc.name, {}))
-                setattr(self, desc.name, value)
+                object.__setattr__(self, desc.name, value)
                 if value:
                     self._fields_present.add(desc.name)
             elif desc.repeated:
                 value = list(kwargs.get(desc.name, []))
-                setattr(self, desc.name, value)
+                object.__setattr__(self, desc.name, value)
                 if value:
                     self._fields_present.add(desc.name)
             else:
                 if desc.name in kwargs:
                     value = kwargs[desc.name]
                     self._fields_present.add(desc.name)
-                    setattr(self, desc.name, value)
+                    object.__setattr__(self, desc.name, value)
+                    if desc.oneof:
+                        self._clear_oneof_branches(desc.oneof, keep_name=desc.name)
                 else:
-                    setattr(self, desc.name, self._default(desc))
+                    object.__setattr__(self, desc.name, self._default(desc))
+
+    def _clear_oneof_branches(self, oneof_name: str, keep_name: Optional[str] = None) -> None:
+        ospec = self.__class__._oneofs.get(oneof_name)
+        if not ospec:
+            return
+        for other_num in ospec.fields:
+            other_desc = self.__class__._field_descriptors[other_num]
+            if other_desc.name == keep_name:
+                continue
+            object.__setattr__(self, other_desc.name, self._default(other_desc))
+            self._fields_present.discard(other_desc.name)
 
     @staticmethod
     def _default(desc: FieldDescriptor) -> Any:
@@ -481,15 +375,7 @@ class Message:
             return desc.message_cls()
         return None
 
-    # ---------- field presence tracking ----------
-
     def has_field(self, name: str) -> bool:
-        """
-        判断字段 "是否出现在消息中"。
-         - 标量字段: 返回 True 仅当构造时显式传入 OR 解码时遇到过该字段
-         - repeated/map: 返回 True 当列表/字典非空
-         - MESSAGE: 返回 True 当构造时显式传入 OR 解码时遇到 (即使子消息是 default)
-        """
         if name not in self.__class__._field_by_name:
             raise KeyError(f"No such field: {name}")
         return name in self._fields_present
@@ -497,26 +383,28 @@ class Message:
     def set_field_present(self, name: str, present: bool = True) -> None:
         if name not in self.__class__._field_by_name:
             raise KeyError(f"No such field: {name}")
+        desc = self.__class__._field_by_name[name]
         if present:
             self._fields_present.add(name)
+            if desc.oneof:
+                self._clear_oneof_branches(desc.oneof, keep_name=name)
         else:
             self._fields_present.discard(name)
+            object.__setattr__(self, name, self._default(desc))
 
     def clear_field(self, name: str) -> None:
-        """把字段置为默认值并标记为未出现。"""
         if name not in self.__class__._field_by_name:
             raise KeyError(f"No such field: {name}")
         desc = self.__class__._field_by_name[name]
         if desc.is_map:
-            setattr(self, name, {})
+            object.__setattr__(self, name, {})
         elif desc.repeated:
-            setattr(self, name, [])
+            object.__setattr__(self, name, [])
         else:
-            setattr(self, name, self._default(desc))
+            object.__setattr__(self, name, self._default(desc))
         self._fields_present.discard(name)
 
     def which_oneof(self, name: str) -> Optional[str]:
-        """返回该 oneof 组里当前有值的字段名, 都没值返回 None。"""
         if name not in self.__class__._oneofs:
             raise KeyError(f"No such oneof: {name}")
         for field_num in self.__class__._oneofs[name].fields:
@@ -525,17 +413,8 @@ class Message:
                 return fname
         return None
 
-    # ---------- 验证 ----------
-
     def validate(self) -> None:
-        """
-        encode 之前的业务校验:
-          1) required 字段必须存在或非默认
-          2) 同一 oneof 组不得有多个字段同时被显式设置
-        """
         cls = self.__class__
-
-        # 1. required
         missing_required: List[str] = []
         for desc in cls._field_descriptors.values():
             if desc.required:
@@ -551,8 +430,6 @@ class Message:
             raise RequiredFieldError(
                 f"Required fields not set: {', '.join(missing_required)}"
             )
-
-        # 2. oneof conflict (构造时同时显式 set 了多个)
         for oname, ospec in cls._oneofs.items():
             set_fields = [
                 cls._field_descriptors[n].name
@@ -564,8 +441,6 @@ class Message:
                     f"Oneof group '{oname}': multiple fields set "
                     f"({', '.join(set_fields)}); only one may be set"
                 )
-
-    # ---------- 注册 ----------
 
     @classmethod
     def _register_field(cls, spec: _FieldSpec, name: str) -> None:
@@ -590,7 +465,6 @@ class Message:
         cls._field_descriptors[spec.number] = desc
         cls._field_by_name[name] = desc
 
-        # 注册 oneof
         if spec.oneof:
             if spec.oneof not in cls._oneofs:
                 cls._oneofs[spec.oneof] = _OneofSpec(spec.oneof)
@@ -602,8 +476,7 @@ class Message:
                      message_cls: Optional[Type["Message"]] = None,
                      map: Optional[Tuple[FieldType, FieldType]] = None,
                      value_message_cls: Optional[Type["Message"]] = None,
-                     required: bool = False,
-                     oneof: Optional[str] = None) -> None:
+                     required: bool = False, oneof: Optional[str] = None) -> None:
         if map is not None:
             if not isinstance(map, tuple) or len(map) != 2:
                 raise SchemaError("map must be a tuple of (key_type, value_type)")
@@ -632,8 +505,6 @@ class Message:
             )
         cls._register_field(spec, name)
 
-    # ---------- introspection ----------
-
     @classmethod
     def list_fields(cls) -> ItemsView[int, FieldDescriptor]:
         return items_view_sorted(cls._field_descriptors)
@@ -647,21 +518,15 @@ class Message:
 
     @classmethod
     def format_schema(cls, indent: int = 0) -> str:
-        """导出 IDL 风格的 schema 文本, 递归展开嵌套 message。"""
         lines: List[str] = []
         prefix = "  " * indent
         lines.append(f"{prefix}message {cls.__name__} {{")
 
         ip = indent + 1
-        iprefix = "  " * ip
-        iiprefix = "  " * (indent + 2)
-
-        oneof_emitted_groups: Set[str] = set()
         standalone_sorted = sorted(
             [d for d in cls._field_descriptors.values() if not d.oneof],
             key=lambda d: d.number,
         )
-
         all_items: List[Tuple[int, Any]] = []
         for d in standalone_sorted:
             all_items.append((d.number, ("field", d)))
@@ -672,7 +537,6 @@ class Message:
         for oname, group in oname_groups.items():
             min_n = min(d.number for d in group)
             all_items.append((min_n, ("oneof", oname, group)))
-
         all_items.sort(key=lambda x: x[0])
 
         for _n, item in all_items:
@@ -680,10 +544,10 @@ class Message:
                 lines.append(_format_field_line(item[1], ip))
             else:
                 oname, group = item[1], item[2]
-                lines.append(f"{iprefix}oneof {oname} {{")
+                lines.append(f"{'  ' * ip}oneof {oname} {{")
                 for gd in sorted(group, key=lambda d: d.number):
                     lines.append(_format_field_line(gd, indent + 2))
-                lines.append(f"{iprefix}}}")
+                lines.append(f"{'  ' * ip}}}")
 
         lines.append(f"{prefix}}}")
 
@@ -699,8 +563,6 @@ class Message:
                 lines.append("")
                 lines.append(mc.format_schema(indent))
         return "\n".join(lines)
-
-    # ---------- repr / eq ----------
 
     def __repr__(self) -> str:
         parts = []
@@ -736,12 +598,10 @@ def _format_field_line(desc: FieldDescriptor, indent: int) -> str:
         parts.append("repeated")
     elif not desc.is_map:
         parts.append("optional")
-
     if desc.field_type == FieldType.MESSAGE:
         parts.append(desc.message_cls.__name__)
     else:
         parts.append(desc.field_type.name)
-
     parts.append(desc.name)
     parts.append(f"= {desc.number};")
     return f"{p}{' '.join(parts)}"
@@ -996,13 +856,8 @@ def _encode_packed_field(desc: FieldDescriptor, values: Sequence[Any]) -> bytes:
 
 
 def encode(msg: Message, validate: bool = True) -> bytes:
-    """
-    序列化消息。validate=True 时在编码前调用 msg.validate()
-    检查 required 字段和 oneof 冲突。
-    """
     if validate:
         msg.validate()
-
     buf = bytearray()
     cls = msg.__class__
     for desc in cls._field_descriptors.values():
@@ -1052,10 +907,6 @@ def _skip_field(stream: BytesIO, wire_type: int) -> None:
 
 def decode(cls: Type[T], data: bytes,
            stack: Optional[List[str]] = None) -> T:
-    """
-    反序列化。返回的消息中 _fields_present 会记录哪些字段实际出现过,
-    可通过 has_field() 查询。oneof 组若出现多次, 保留最后写入的值。
-    """
     if stack is None:
         stack = [cls.__name__]
     stream = BytesIO(data)
@@ -1095,13 +946,14 @@ def decode(cls: Type[T], data: bytes,
         default_wire = expected_wire_defaults[field_number]
         ctx = f"{'.'.join(stack)}.{desc.name}@offset={pos}"
 
-        # oneof: 如果该字段属于 oneof, 先清理同组其他字段的 presence
+        # oneof: 重置同组其他字段为默认值 + 清 presence
         if desc.oneof:
             ospec = cls._oneofs[desc.oneof]
             for other_num in ospec.fields:
-                other_name = cls._field_descriptors[other_num].name
-                if other_name != desc.name:
-                    present.discard(other_name)
+                other_desc = cls._field_descriptors[other_num]
+                if other_desc.name != desc.name:
+                    present.discard(other_desc.name)
+                    kwargs[other_desc.name] = Message._default(other_desc)
 
         if desc.is_map:
             if wire_type != WIRE_LEN:
@@ -1152,33 +1004,29 @@ def decode(cls: Type[T], data: bytes,
             present.add(desc.name)
 
     instance = cls.__new__(cls)
-    # 先初始化 _fields_present
     instance._fields_present = present
-
-    # 再填属性, 但默认值不走 has_field set
     for desc in cls._field_descriptors.values():
         if desc.name in kwargs:
-            setattr(instance, desc.name, kwargs[desc.name])
+            object.__setattr__(instance, desc.name, kwargs[desc.name])
         else:
             if desc.is_map:
-                setattr(instance, desc.name, {})
+                object.__setattr__(instance, desc.name, {})
             elif desc.repeated:
-                setattr(instance, desc.name, [])
+                object.__setattr__(instance, desc.name, [])
             else:
-                setattr(instance, desc.name, Message._default(desc))
-
+                object.__setattr__(instance, desc.name, Message._default(desc))
     return instance
 
 
 # ---------------------------------------------------------------------------
-# 兼容性检查 (Schema Compatibility Checker)
+# 兼容性检查 — 升级为路径级递归
 # ---------------------------------------------------------------------------
 
 @dataclass
 class FieldDiff:
-    field_number: int
-    change: str  # "added" | "removed" | "renamed" | "type_changed" |
-                 # "label_changed" | "required_changed" | "number_moved"
+    path: str
+    field_number: Optional[int]
+    change: str
     old_name: Optional[str] = None
     new_name: Optional[str] = None
     old_type: Optional[FieldType] = None
@@ -1199,147 +1047,204 @@ class CompatReport:
                    default=CompatLevel.FULLY_COMPATIBLE)
 
 
-def diff_schemas(old_cls: Type[Message], new_cls: Type[Message]) -> List[FieldDiff]:
-    """
-    对比两个 schema, 返回字段差异列表。
-    对比逻辑: 以 field_number 为主键 (这是线上协议的主键),
-              field_name / type / label 变化都算改动。
-    """
-    diffs: List[FieldDiff] = []
+def _compare_type(
+    old_ft: FieldType, new_ft: FieldType,
+    old_msg_cls: Optional[Type[Message]],
+    new_msg_cls: Optional[Type[Message]],
+    path: str, field_number: Optional[int],
+    old_name: Optional[str], new_name: Optional[str],
+    acc: List[FieldDiff],
+) -> None:
+    if old_ft != new_ft:
+        acc.append(FieldDiff(
+            path=path, field_number=field_number, change="type_changed",
+            old_name=old_name, new_name=new_name,
+            old_type=old_ft, new_type=new_ft,
+            level=CompatLevel.BREAKING,
+            detail=f"{path}: 类型从 {old_ft.name} 改成 {new_ft.name} — 破坏性!",
+        ))
+        return
+    if old_ft == FieldType.MESSAGE and old_msg_cls and new_msg_cls:
+        _recurse_diff(old_msg_cls, new_msg_cls, path, acc)
 
+
+def _recurse_diff(old_cls: Type[Message], new_cls: Type[Message],
+                  path_prefix: str, acc: List[FieldDiff]) -> None:
     old_by_num: Dict[int, FieldDescriptor] = dict(old_cls._field_descriptors)
     new_by_num: Dict[int, FieldDescriptor] = dict(new_cls._field_descriptors)
 
-    # 建立 name→number 映射以辅助重命名检测
     old_names = {d.name: n for n, d in old_by_num.items()}
     new_names = {d.name: n for n, d in new_by_num.items()}
 
     removed_nums = set(old_by_num.keys()) - set(new_by_num.keys())
     added_nums = set(new_by_num.keys()) - set(old_by_num.keys())
 
-    # 尝试配对 removed + added: 同一个 name 出现在不同 number → 改号
-    renamed_pairs: List[Tuple[int, int]] = []
-    processed_removed: Set[int] = set()
-    processed_added: Set[int] = set()
-    for oname, onum in old_names.items():
+    def _p(name: str) -> str:
+        return f"{path_prefix}.{name}" if path_prefix else name
+
+    # 同名字段改号
+    for oname, onum in list(old_names.items()):
         if oname in new_names and onum != new_names[oname]:
             nnum = new_names[oname]
             if onum in removed_nums and nnum in added_nums:
-                renamed_pairs.append((onum, nnum))
-                processed_removed.add(onum)
-                processed_added.add(nnum)
-                od = old_by_num[onum]
-                nd = new_by_num[nnum]
-                level = CompatLevel.BREAKING
-                detail = f"字段号从 {onum} 改成 {nnum} — 线上不兼容"
+                removed_nums.discard(onum); added_nums.discard(nnum)
+                od, nd = old_by_num[onum], new_by_num[nnum]
+                p = _p(oname)
+                detail = f"{p}: 字段号从 {onum} 改成 {nnum} — 线上不兼容"
                 if od.field_type != nd.field_type:
                     detail += f", 类型也从 {od.field_type.name} 改成 {nd.field_type.name}"
-                if od.is_map or od.repeated or nd.is_map or nd.repeated:
-                    detail += " (label 也不同)"
-                diffs.append(FieldDiff(
-                    field_number=nnum, change="number_moved",
-                    old_name=oname, new_name=oname, level=level, detail=detail,
+                acc.append(FieldDiff(
+                    path=p, field_number=nnum, change="number_moved",
+                    old_name=oname, new_name=oname,
+                    level=CompatLevel.BREAKING, detail=detail,
                 ))
+                _compare_type(od.field_type, nd.field_type,
+                              od.message_cls, nd.message_cls,
+                              p, nnum, oname, oname, acc)
+                if od.is_map and nd.is_map:
+                    if od.key_type != nd.key_type:
+                        kp = f"{p}<key>"
+                        acc.append(FieldDiff(
+                            path=kp, field_number=None, change="type_changed",
+                            old_type=od.key_type, new_type=nd.key_type,
+                            level=CompatLevel.BREAKING,
+                            detail=f"{kp}: map key 从 {od.key_type.name} 改成 {nd.key_type.name}",
+                        ))
+                    if od.value_type != nd.value_type:
+                        vp = f"{p}<value>"
+                        acc.append(FieldDiff(
+                            path=vp, field_number=None, change="type_changed",
+                            old_type=od.value_type, new_type=nd.value_type,
+                            level=CompatLevel.BREAKING,
+                            detail=f"{vp}: map value 从 {od.value_type.name} 改成 {nd.value_type.name}",
+                        ))
+                    elif (od.value_type == FieldType.MESSAGE
+                          and nd.value_type == FieldType.MESSAGE
+                          and od.value_message_cls and nd.value_message_cls):
+                        _recurse_diff(od.value_message_cls, nd.value_message_cls,
+                                      vp, acc)
 
-    for onum in removed_nums - processed_removed:
+    for onum in removed_nums:
         od = old_by_num[onum]
+        p = _p(od.name)
         level = CompatLevel.BREAKING if od.required else CompatLevel.WARNING
-        detail = f"字段 #{onum} '{od.name}' ({od.field_type.name}) 删除"
+        detail = f"{p}: 字段 #{onum} '{od.name}' ({od.field_type.name}) 删除"
         if od.required:
             detail += " — ⚠️ 该字段是 required, 删除是破坏性改动"
-        diffs.append(FieldDiff(
-            field_number=onum, change="removed",
+        acc.append(FieldDiff(
+            path=p, field_number=onum, change="removed",
             old_name=od.name, old_type=od.field_type,
             level=level, detail=detail,
         ))
 
-    for nnum in added_nums - processed_added:
+    for nnum in added_nums:
         nd = new_by_num[nnum]
+        p = _p(nd.name)
         level = (CompatLevel.SAFE_EXTENSION
                  if not nd.required else CompatLevel.WARNING)
-        detail = (f"字段 #{nnum} '{nd.name}' ({nd.field_type.name}) 新增"
-                  + (" — ⚠️ 新增 required 字段对旧数据不兼容" if nd.required else ""))
-        diffs.append(FieldDiff(
-            field_number=nnum, change="added",
+        detail = f"{p}: 字段 #{nnum} '{nd.name}' ({nd.field_type.name}) 新增"
+        if nd.required:
+            detail += " — ⚠️ 新增 required 字段对旧数据不兼容"
+        acc.append(FieldDiff(
+            path=p, field_number=nnum, change="added",
             new_name=nd.name, new_type=nd.field_type,
             level=level, detail=detail,
         ))
+        if nd.field_type == FieldType.MESSAGE and nd.message_cls:
+            _recurse_diff(Message, nd.message_cls, p, acc)
+        if (nd.is_map and nd.value_type == FieldType.MESSAGE
+                and nd.value_message_cls):
+            _recurse_diff(Message, nd.value_message_cls, f"{p}<value>", acc)
 
-    # 相同 number 的字段改动
     for num in set(old_by_num.keys()) & set(new_by_num.keys()):
-        od = old_by_num[num]
-        nd = new_by_num[num]
+        od, nd = old_by_num[num], new_by_num[num]
+        p = _p(od.name)
 
-        # 改名 (仅 name 变, type/label 没改)
         if od.name != nd.name:
-            diffs.append(FieldDiff(
-                field_number=num, change="renamed",
+            acc.append(FieldDiff(
+                path=p, field_number=num, change="renamed",
                 old_name=od.name, new_name=nd.name,
                 level=CompatLevel.FULLY_COMPATIBLE,
-                detail=f"字段 #{num} 名从 '{od.name}' 改成 '{nd.name}' — 线上兼容",
+                detail=f"{p}: 字段 #{num} 名从 '{od.name}' 改成 '{nd.name}' — 线上兼容",
             ))
 
-        # 类型变化
-        if od.field_type != nd.field_type:
-            diffs.append(FieldDiff(
-                field_number=num, change="type_changed",
+        _compare_type(od.field_type, nd.field_type,
+                      od.message_cls, nd.message_cls,
+                      p, num, od.name, nd.name, acc)
+
+        if od.is_map and nd.is_map:
+            if od.key_type != nd.key_type:
+                kp = f"{p}<key>"
+                acc.append(FieldDiff(
+                    path=kp, field_number=None, change="type_changed",
+                    old_type=od.key_type, new_type=nd.key_type,
+                    level=CompatLevel.BREAKING,
+                    detail=f"{kp}: map key 从 {od.key_type.name} 改成 {nd.key_type.name}",
+                ))
+            if od.value_type != nd.value_type:
+                vp = f"{p}<value>"
+                acc.append(FieldDiff(
+                    path=vp, field_number=None, change="type_changed",
+                    old_type=od.value_type, new_type=nd.value_type,
+                    level=CompatLevel.BREAKING,
+                    detail=f"{vp}: map value 从 {od.value_type.name} 改成 {nd.value_type.name}",
+                ))
+            elif (od.value_type == FieldType.MESSAGE
+                  and nd.value_type == FieldType.MESSAGE
+                  and od.value_message_cls and nd.value_message_cls):
+                _recurse_diff(od.value_message_cls, nd.value_message_cls,
+                              f"{p}<value>", acc)
+        elif od.is_map != nd.is_map:
+            acc.append(FieldDiff(
+                path=p, field_number=num, change="label_changed",
                 old_name=od.name, new_name=nd.name,
-                old_type=od.field_type, new_type=nd.field_type,
                 level=CompatLevel.BREAKING,
-                detail=f"字段 #{num} ('{od.name}'→'{nd.name}') 类型从 "
-                       f"{od.field_type.name} 改成 {nd.field_type.name} — 破坏性!",
+                detail=f"{p}: label 从 {'map' if od.is_map else '非 map'} 改成 {'map' if nd.is_map else '非 map'} — 破坏性!",
             ))
 
-        # label 变化 (repeated/map/packed/oneof)
-        old_label = (
-            "map" if od.is_map else
-            f"repeated packed" if od.packed else
-            "repeated" if od.repeated else
-            f"oneof({od.oneof})" if od.oneof else
-            "scalar"
-        )
-        new_label = (
-            "map" if nd.is_map else
-            f"repeated packed" if nd.packed else
-            "repeated" if nd.repeated else
-            f"oneof({nd.oneof})" if nd.oneof else
-            "scalar"
-        )
-        if ((od.is_map != nd.is_map)
-                or (od.repeated != nd.repeated)
-                or (od.packed != nd.packed)
-                or (od.oneof != nd.oneof)):
-            # repeated ↔ packed 通常兼容 (wire_type 通吃)
-            level = CompatLevel.WARNING
-            detail = (f"字段 #{num} label 从 '{old_label}' 改成 '{new_label}'"
-                      + " — 建议仔细检查")
-            # repeated ↔ scalar 或 map ↔ scalar 是破坏性的
-            if (od.repeated != nd.repeated) or (od.is_map != nd.is_map):
-                level = CompatLevel.BREAKING
-                detail += " ⚠️ repeated/map ↔ scalar 是破坏性改动"
-            diffs.append(FieldDiff(
-                field_number=num, change="label_changed",
-                old_name=od.name, new_name=nd.name,
-                level=level, detail=detail,
-            ))
+        if not od.is_map and not nd.is_map:
+            if ((od.repeated != nd.repeated)
+                    or (od.packed != nd.packed)
+                    or (od.oneof != nd.oneof)):
+                old_label = (
+                    "repeated packed" if od.packed else
+                    "repeated" if od.repeated else
+                    f"oneof({od.oneof})" if od.oneof else "scalar"
+                )
+                new_label = (
+                    "repeated packed" if nd.packed else
+                    "repeated" if nd.repeated else
+                    f"oneof({nd.oneof})" if nd.oneof else "scalar"
+                )
+                level = CompatLevel.WARNING
+                detail = f"{p}: label 从 '{old_label}' 改成 '{new_label}'"
+                if od.repeated != nd.repeated:
+                    level = CompatLevel.BREAKING
+                    detail += " ⚠️ repeated ↔ scalar 是破坏性改动"
+                acc.append(FieldDiff(
+                    path=p, field_number=num, change="label_changed",
+                    old_name=od.name, new_name=nd.name,
+                    level=level, detail=detail,
+                ))
 
-        # required 变化
         if od.required != nd.required:
             if od.required and not nd.required:
                 level = CompatLevel.SAFE_EXTENSION
-                detail = f"字段 #{num} 从 required 改成 optional — 安全 (放宽约束)"
+                detail = f"{p}: 从 required 改成 optional — 安全 (放宽约束)"
             else:
                 level = CompatLevel.BREAKING
-                detail = f"字段 #{num} 从 optional 改成 required — 旧数据没这个字段会失败"
-            diffs.append(FieldDiff(
-                field_number=num, change="required_changed",
+                detail = f"{p}: 从 optional 改成 required — 旧数据没这个字段会失败"
+            acc.append(FieldDiff(
+                path=p, field_number=num, change="required_changed",
                 old_name=od.name, new_name=nd.name,
                 level=level, detail=detail,
             ))
 
-    return sorted(diffs, key=lambda d: (
-        -d.level.value, d.field_number, d.change
-    ))
+
+def diff_schemas(old_cls: Type[Message], new_cls: Type[Message]) -> List[FieldDiff]:
+    diffs: List[FieldDiff] = []
+    _recurse_diff(old_cls, new_cls, "", diffs)
+    return sorted(diffs, key=lambda d: (-d.level.value, d.path, d.change))
 
 
 def check_compatibility(old_cls: Type[Message],
@@ -1361,7 +1266,6 @@ _COMPAT_MARKS = {
     CompatLevel.WARNING:         "⚠️",
     CompatLevel.BREAKING:        "💥",
 }
-
 _COMPAT_TITLES = {
     CompatLevel.FULLY_COMPATIBLE: "完全兼容 — 无任何破坏性改动",
     CompatLevel.SAFE_EXTENSION:  "安全扩展 — 仅新增字段",
@@ -1371,11 +1275,9 @@ _COMPAT_TITLES = {
 
 
 def format_compat_report(report: CompatReport) -> str:
-    """生成人类可读的兼容性报告。"""
     lines: List[str] = []
     title = f"Schema 兼容性报告: {report.old_cls_name} → {report.new_cls_name}"
-    lines.append(title)
-    lines.append("=" * len(title))
+    lines.append(title); lines.append("=" * len(title))
     lines.append(
         f"总体评估: {_COMPAT_MARKS[report.overall]} "
         f"{_COMPAT_TITLES[report.overall]}"
@@ -1384,8 +1286,6 @@ def format_compat_report(report: CompatReport) -> str:
     if not report.diffs:
         lines.append("  (完全没有字段变化)")
         return "\n".join(lines)
-
-    # 按等级分组
     for level in (CompatLevel.BREAKING, CompatLevel.WARNING,
                   CompatLevel.SAFE_EXTENSION, CompatLevel.FULLY_COMPATIBLE):
         items = [d for d in report.diffs if d.level == level]
@@ -1393,20 +1293,127 @@ def format_compat_report(report: CompatReport) -> str:
             continue
         lines.append(f"  {_COMPAT_MARKS[level]} {level.name}:")
         for d in items:
-            lines.append(f"    - #{d.field_number:<3} {d.change:<18} {d.detail}")
+            lines.append(f"    - {d.change:<18} {d.detail}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
 
 # ---------------------------------------------------------------------------
-# 诊断 dump_data — 升级: 损坏定位 + 概览 + only_fields 过滤
+# Schema 迁移辅助
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MigrationIssue:
+    path: str
+    kind: str
+    detail: str = ""
+
+
+@dataclass
+class MigrationReport:
+    issues: List[MigrationIssue]
+    decoded: Optional[Message]
+
+    def missing_required(self) -> List[str]:
+        return [i.path for i in self.issues if i.kind == "missing_required"]
+
+    def default_filled(self) -> List[str]:
+        return [i.path for i in self.issues if i.kind == "default_filled"]
+
+
+def _collect_migration_issues(msg: Message, path_prefix: str,
+                              issues: List[MigrationIssue]) -> None:
+    cls = msg.__class__
+    for desc in cls._field_descriptors.values():
+        p = f"{path_prefix}.{desc.name}" if path_prefix else desc.name
+        if desc.is_map:
+            if not msg.has_field(desc.name):
+                if desc.required:
+                    issues.append(MigrationIssue(
+                        path=p, kind="missing_required",
+                        detail=f"{p}: required map 字段缺失",
+                    ))
+                else:
+                    issues.append(MigrationIssue(
+                        path=p, kind="default_filled",
+                        detail=f"{p}: map 字段未出现, 补空 dict",
+                    ))
+            elif (desc.value_type == FieldType.MESSAGE
+                  and desc.value_message_cls):
+                for k, v in getattr(msg, desc.name).items():
+                    _collect_migration_issues(v, f"{p}[{k!r}]", issues)
+            continue
+        if desc.repeated:
+            if not msg.has_field(desc.name):
+                if desc.required:
+                    issues.append(MigrationIssue(
+                        path=p, kind="missing_required",
+                        detail=f"{p}: required repeated 字段缺失",
+                    ))
+                else:
+                    issues.append(MigrationIssue(
+                        path=p, kind="default_filled",
+                        detail=f"{p}: repeated 字段未出现, 补空列表",
+                    ))
+            elif desc.field_type == FieldType.MESSAGE and desc.message_cls:
+                for i, v in enumerate(getattr(msg, desc.name)):
+                    _collect_migration_issues(v, f"{p}[{i}]", issues)
+            continue
+        if not msg.has_field(desc.name):
+            if desc.required:
+                issues.append(MigrationIssue(
+                    path=p, kind="missing_required",
+                    detail=f"{p}: required 字段缺失",
+                ))
+            else:
+                issues.append(MigrationIssue(
+                    path=p, kind="default_filled",
+                    detail=f"{p}: 字段未出现, 补默认值 {Message._default(desc)!r}",
+                ))
+            if desc.field_type == FieldType.MESSAGE and desc.message_cls:
+                _collect_migration_issues(getattr(msg, desc.name), p, issues)
+        elif desc.field_type == FieldType.MESSAGE and desc.message_cls:
+            _collect_migration_issues(getattr(msg, desc.name), p, issues)
+
+
+def try_migrate(old_bytes: bytes, new_cls: Type[T]) -> MigrationReport:
+    try:
+        decoded = decode(new_cls, old_bytes)
+    except Exception as exc:
+        issues = [MigrationIssue(
+            path="<decode>", kind="missing_required",
+            detail=f"解码失败: {exc}",
+        )]
+        return MigrationReport(issues=issues, decoded=None)
+    issues: List[MigrationIssue] = []
+    _collect_migration_issues(decoded, "", issues)
+    return MigrationReport(issues=issues, decoded=decoded)
+
+
+def format_migration_report(report: MigrationReport) -> str:
+    lines: List[str] = []
+    missing = [i for i in report.issues if i.kind == "missing_required"]
+    defaulted = [i for i in report.issues if i.kind == "default_filled"]
+    lines.append("Schema 迁移报告"); lines.append("================")
+    lines.append(f"  ⚠️ 缺失 required 字段: {len(missing)}")
+    for i in missing:
+        lines.append(f"     - {i.detail}")
+    lines.append(f"  📝 被补默认值的字段:    {len(defaulted)}")
+    for i in defaulted:
+        lines.append(f"     - {i.detail}")
+    if report.decoded is None:
+        lines.append("  ❌ 解码失败, 无法生成消息实例")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# dump_data 再升级: 名字/路径过滤、嵌套缩进、损坏恢复继续解析
 # ---------------------------------------------------------------------------
 
 @dataclass
 class DumpResult:
     fields: List[Dict[str, Any]] = field(default_factory=list)
-    error_at_offset: Optional[int] = None
-    error_message: Optional[str] = None
+    errors: List[Dict[str, Any]] = field(default_factory=list)
     total_bytes: int = 0
 
 
@@ -1416,229 +1423,25 @@ def _fmt_val(ft: FieldType, value: Any) -> str:
     return repr(value)
 
 
-def dump_data(cls: Type[Message], data: bytes,
-              out: Optional[Callable[[str], None]] = None,
-              only_fields: Optional[Iterable[int]] = None,
-              ) -> DumpResult:
-    """
-    诊断 dump: 逐字段打印 tag / wire_type / raw hex / 值。
-
-    新增:
-      - only_fields: 只看这些 field_number
-      - 损坏定位: 标出首个错误 offset, 以及错误前后能解析的字段
-      - 返回 DumpResult, 便于程序化使用
-    """
-    if out is None:
-        def _default_out(s: str) -> None:
-            print(s)
-        out = _default_out
-
-    only_set = (set(int(x) for x in only_fields)
-                if only_fields is not None else None)
-
-    result = DumpResult(total_bytes=len(data))
-
-    header = f"=== tinybuf dump: {cls.__name__} ({len(data)} bytes)"
-    if only_set:
-        header += f", 仅显示字段 {sorted(only_set)}"
-    header += " ==="
-    out(header)
-    out(f"  raw hex: {data.hex(' ')}")
-    out("")
-
-    stream = BytesIO(data)
-    total = len(data)
-    idx_visible = 0
-    idx_total = 0
-    while stream.tell() < total:
-        start = stream.tell()
-        error_here = False
-
-        # 读 tag
-        try:
-            tag_raw = decode_varint(
-                stream, f"tag@{start}", allow_64bit_spill=True,
-            )
-        except DecodeError as exc:
-            out(f"  ❗ ERROR at offset={start:<6}: 无法读取 tag — {exc}")
-            result.error_at_offset = start
-            result.error_message = f"tag decode error: {exc}"
-            error_here = True
-            break
-        except Exception as exc:
-            out(f"  ❗ ERROR at offset={start:<6}: {exc}")
-            result.error_at_offset = start
-            result.error_message = str(exc)
-            error_here = True
-            break
-
-        field_number, wire_type = parse_tag(tag_raw)
-        tag_end = stream.tell()
-        tag_bytes = data[start:tag_end]
-
-        visible = (only_set is None) or (field_number in only_set)
-
-        # 先 "探测" 整个 field 的长度, 尝试拿到 raw
-        mark = stream.tell()
-        try:
-            raw_bytes = _peek_field_raw(stream, start, wire_type, f"dump@{start}")
-        except DecodeError as exc:
-            # 即使 peek 失败, 也把已经读到的字节截取出来展示
-            raw_bytes = data[start:stream.tell()]
-            if visible:
-                out(f"  [{idx_visible:03d}] offset={start:<6} "
-                    f"field={field_number:<4} "
-                    f"wire={wire_type}({_WIRE_NAME.get(wire_type, '?'):<7}) "
-                    f"❌ ERROR: {exc}")
-                out(f"           tag={tag_bytes.hex(' '):<20} "
-                    f"raw (部分)={raw_bytes.hex(' ')}")
-                idx_visible += 1
-            result.fields.append({
-                "offset": start, "field_number": field_number,
-                "wire_type": wire_type, "error": str(exc),
-            })
-            result.error_at_offset = start
-            result.error_message = str(exc)
-            error_here = True
-            idx_total += 1
-            break
-        except Exception as exc:
-            raw_bytes = data[start:stream.tell()]
-            out(f"  ❗ ERROR at offset={start:<6}: {exc}")
-            result.error_at_offset = start
-            result.error_message = str(exc)
-            error_here = True
-            break
-
-        desc = cls._field_descriptors.get(field_number)
-
-        # 解析值
-        value_repr = "<unknown>"
-        try:
-            v_stream = BytesIO(raw_bytes)
-            decode_varint(v_stream, "dump.tag", allow_64bit_spill=True)
-            if desc is None:
-                value_repr = "<unknown (skipped)>"
-            else:
-                if desc.is_map:
-                    entry = _decode_single_value(desc, v_stream, f"dump.{desc.name}")
-                    value_repr = f"entry(key={entry.key!r}, value={entry.value!r})"
-                elif desc.repeated and desc.packable() and wire_type == WIRE_LEN:
-                    length = decode_varint(
-                        v_stream, f"dump.{desc.name}.packed.length",
-                    )
-                    payload = _assert_read(
-                        v_stream, length, "dump.packed.payload",
-                    )
-                    values = _decode_packed_values(desc, payload, f"dump.{desc.name}")
-                    value_repr = f"packed[{', '.join(repr(v) for v in values)}]"
-                else:
-                    value = _decode_single_value(desc, v_stream, f"dump.{desc.name}")
-                    value_repr = _fmt_val(desc.field_type, value)
-        except DecodeError as exc:
-            value_repr = f"<decode error: {exc}>"
-        except Exception as exc:
-            value_repr = f"<error: {exc}>"
-
-        entry = {
-            "offset": start,
-            "field_number": field_number,
-            "wire_type": wire_type,
-            "tag_bytes": bytes(tag_bytes),
-            "raw_bytes": bytes(raw_bytes),
-            "desc": desc,
-            "value_repr": value_repr,
-            "value_error": "<decode error" in value_repr,
-        }
-        result.fields.append(entry)
-
-        if visible:
-            if desc is None:
-                name_str = "?"
-            else:
-                extra = ""
-                if desc.is_map:
-                    extra = " map"
-                elif desc.repeated and desc.packed:
-                    extra = " repeated packed"
-                elif desc.repeated:
-                    extra = " repeated"
-                elif desc.oneof:
-                    extra = f" oneof({desc.oneof})"
-                if desc.required:
-                    extra += " required"
-                name_str = f"{desc.name}({desc.field_type.name}{extra})"
-
-            out(
-                f"  [{idx_visible:03d}] offset={start:<6} "
-                f"field={field_number:<4} "
-                f"wire={wire_type}({_WIRE_NAME.get(wire_type, '?'):<7}) "
-                f"name={name_str}"
-            )
-            out(
-                f"           tag={tag_bytes.hex(' '):<20} "
-                f"raw={raw_bytes.hex(' ')}"
-            )
-            out(f"           value={value_repr}")
-            out("")
-            idx_visible += 1
-
-        idx_total += 1
-
-    # 结尾: 如果中途出错, 打印概览
-    lines_addendum: List[str] = []
-    if result.error_at_offset is not None:
-        lines_addendum.append(
-            f"*** 首个损坏位置: offset={result.error_at_offset}, "
-            f"原因: {result.error_message}"
-        )
-        ok_numbers = [f["field_number"] for f in result.fields
-                      if not f.get("error") and not f.get("value_error")]
-        lines_addendum.append(
-            f"  损坏之前成功解析的字段号: {ok_numbers or '(无)'}"
-        )
-        bad = stream.tell()
-        if bad < total:
-            residue = data[bad:]
-            # 尝试从下一个合法 tag 恢复 (仅诊断)
-            restore_offset: Optional[int] = None
-            for probe in range(bad + 1, total):
-                test = BytesIO(data[probe:])
-                try:
-                    t = decode_varint(test, f"probe@{probe}",
-                                      allow_64bit_spill=True)
-                    fn, wt = parse_tag(t)
-                    if 1 <= fn <= 1_000_000 and wt in _WIRE_NAME:
-                        # 尝试 peek 这个 field 看看能不能走通
-                        test2 = BytesIO(data[probe:])
-                        try:
-                            _peek_field_raw(test2, probe, wt, f"restore@{probe}")
-                            restore_offset = probe
-                            break
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-            lines_addendum.append(
-                f"  损坏之后剩余字节: {len(residue)} bytes ({residue.hex(' ')})"
-            )
-            if restore_offset is not None:
-                lines_addendum.append(
-                    f"  可能能恢复解析的下一个 offset: {restore_offset}"
-                )
-    lines_addendum.append(
-        f"=== end: 共扫描 {idx_total} 字段 (显示 {idx_visible}), "
-        f"结果 = {'正常' if not error_here else '有损坏'} ==="
-    )
-    for line in lines_addendum:
-        out(line)
-
-    return result
+def _filter_accepts(field_number: int, field_name: str, path_prefix: str,
+                    only_fields: Optional[Set[int]],
+                    only_names: Optional[Set[str]],
+                    only_paths: Optional[Set[str]]) -> bool:
+    full_path = f"{path_prefix}.{field_name}" if path_prefix else field_name
+    if only_fields is not None and field_number not in only_fields:
+        return False
+    if only_names is not None and field_name not in only_names:
+        return False
+    if only_paths is not None:
+        match = any(full_path == op or full_path.startswith(op + ".")
+                    for op in only_paths)
+        if not match:
+            return False
+    return True
 
 
 def _peek_field_raw(stream: BytesIO, start: int, wire_type: int,
                     ctx: str) -> bytes:
-    """Peek 整个 field (tag + value) 的原始字节。"""
     if wire_type == WIRE_VARINT:
         decode_varint(stream, f"{ctx}.value", allow_64bit_spill=True)
     elif wire_type == WIRE_LEN:
@@ -1654,393 +1457,710 @@ def _peek_field_raw(stream: BytesIO, start: int, wire_type: int,
     return stream.getvalue()[start:end]
 
 
+def _try_find_next_tag(data: bytes, start_probe: int, end: int,
+                       known_field_numbers: Optional[Set[int]] = None) -> Optional[int]:
+    """从 start_probe 开始逐字节寻找下一个能完整解码 field 的 offset。
+    如果提供 known_field_numbers，优先返回那些字段号匹配的候选。"""
+    first_valid: Optional[int] = None
+    for probe in range(start_probe, end):
+        test = BytesIO(data[probe:])
+        try:
+            t = decode_varint(test, f"probe@{probe}", allow_64bit_spill=True)
+        except Exception:
+            continue
+        if t == 0:
+            continue
+        fn, wt = parse_tag(t)
+        if fn < 1 or fn > 1_000_000 or wt not in _WIRE_NAME:
+            continue
+        test2 = BytesIO(data[probe:])
+        try:
+            _peek_field_raw(test2, probe, wt, f"restore@{probe}")
+        except Exception:
+            continue
+        if known_field_numbers is not None and fn in known_field_numbers:
+            return probe
+        if first_valid is None:
+            first_valid = probe
+    return first_valid
+
+
+def _dump_one_level(cls: Type[Message], data: bytes,
+                    out: Callable[[str], None],
+                    path_prefix: str, indent_level: int,
+                    only_fields: Optional[Set[int]],
+                    only_names: Optional[Set[str]],
+                    only_paths: Optional[Set[str]],
+                    result: DumpResult,
+                    expand_nested: bool = True,
+                    ) -> None:
+    ind = "  " * indent_level
+    stream = BytesIO(data)
+    total = len(data)
+    idx_visible = 0
+    idx_total = 0
+
+    if indent_level == 0:
+        header = f"=== tinybuf dump: {cls.__name__} ({len(data)} bytes)"
+        parts = []
+        if only_fields is not None:
+            parts.append(f"字段号={sorted(only_fields)}")
+        if only_names is not None:
+            parts.append(f"字段名={sorted(only_names)}")
+        if only_paths is not None:
+            parts.append(f"路径={sorted(only_paths)}")
+        if parts:
+            header += f" (过滤: {', '.join(parts)})"
+        header += " ==="
+        out(header)
+        out(f"  raw hex: {data.hex(' ')}")
+        out("")
+
+    next_after_error_offset: Optional[int] = None
+    resumed = False
+
+    while stream.tell() < total:
+        start = stream.tell()
+        current_error: Optional[str] = None
+
+        try:
+            tag_raw = decode_varint(
+                stream, f"tag@{start}", allow_64bit_spill=True,
+            )
+        except DecodeError as exc:
+            current_error = f"无法读取 tag — {exc}"
+        except Exception as exc:
+            current_error = str(exc)
+
+        if current_error:
+            err_info = {
+                "offset": start,
+                "error": current_error,
+                "resumed": False,
+            }
+            result.errors.append(err_info)
+            out(f"{ind}  ❗ ERROR at offset={start:<6}: {current_error}")
+            # 尝试恢复
+            next_ok = _try_find_next_tag(
+                data, start + 1, total,
+                known_field_numbers=set(cls._field_descriptors.keys()),
+            )
+            if next_ok is not None:
+                out(f"{ind}     ↻ 尝试恢复解析, 下一个合法 field 在 offset={next_ok}")
+                err_info["resumed"] = True
+                err_info["resume_offset"] = next_ok
+                stream.seek(next_ok)
+                resumed = True
+                continue
+            break
+
+        field_number, wire_type = parse_tag(tag_raw)
+        tag_end = stream.tell()
+        tag_bytes = data[start:tag_end]
+
+        # peek 整个 field 长度
+        try:
+            raw_bytes = _peek_field_raw(stream, start, wire_type,
+                                         f"dump@{start}")
+        except DecodeError as exc:
+            raw_bytes = data[start:stream.tell()]
+            err_info = {
+                "offset": start,
+                "field_number": field_number,
+                "wire_type": wire_type,
+                "error": str(exc),
+            }
+            result.errors.append(err_info)
+            desc = cls._field_descriptors.get(field_number)
+            fn = desc.name if desc else "?"
+            if _filter_accepts(field_number, fn, path_prefix,
+                               only_fields, only_names, only_paths):
+                out(
+                    f"{ind}  [{idx_visible:03d}] offset={start:<6} "
+                    f"field={field_number:<4} "
+                    f"wire={wire_type}({_WIRE_NAME.get(wire_type, '?'):<7}) "
+                    f"❌ ERROR: {exc}"
+                )
+                out(f"{ind}           tag={tag_bytes.hex(' '):<20} "
+                    f"raw (部分)={raw_bytes.hex(' ')}")
+                idx_visible += 1
+            probe_start = tag_end
+            if probe_start <= start:
+                probe_start = start + 1
+            next_ok = _try_find_next_tag(
+                data, probe_start, total,
+                known_field_numbers=set(cls._field_descriptors.keys()),
+            )
+            if next_ok is not None:
+                out(f"{ind}     ↻ 尝试恢复, 下一合法 field offset={next_ok}")
+                stream.seek(next_ok)
+                continue
+            break
+
+        desc = cls._field_descriptors.get(field_number)
+        field_name = desc.name if desc else "?"
+
+        visible = _filter_accepts(field_number, field_name, path_prefix,
+                                  only_fields, only_names, only_paths)
+
+        value_repr = "<unknown>"
+        sub_payload_bytes: Optional[bytes] = None
+        try:
+            v_stream = BytesIO(raw_bytes)
+            decode_varint(v_stream, "dump.tag", allow_64bit_spill=True)
+            if desc is None:
+                value_repr = "<unknown (skipped)>"
+            elif desc.is_map:
+                entry = _decode_single_value(desc, v_stream, f"dump.{desc.name}")
+                value_repr = f"entry(key={entry.key!r}, value={entry.value!r})"
+            elif desc.repeated and desc.packable() and wire_type == WIRE_LEN:
+                length = decode_varint(
+                    v_stream, f"dump.{desc.name}.packed.length",
+                )
+                payload = _assert_read(
+                    v_stream, length, "dump.packed.payload",
+                )
+                values = _decode_packed_values(desc, payload, f"dump.{desc.name}")
+                value_repr = f"packed[{', '.join(_fmt_val(desc.field_type, v) for v in values)}]"
+            elif desc.repeated:
+                value = _decode_single_value(desc, v_stream, f"dump.{desc.name}")
+                value_repr = _fmt_val(desc.field_type, value)
+            elif desc.field_type == FieldType.MESSAGE and not desc.is_map:
+                length = decode_varint(v_stream, f"dump.{desc.name}.length")
+                sub_payload_bytes = _assert_read(
+                    v_stream, length, f"dump.{desc.name}.payload",
+                )
+                value_repr = f"<message {desc.message_cls.__name__}, {length} bytes>"
+            else:
+                value = _decode_single_value(desc, v_stream, f"dump.{desc.name}")
+                value_repr = _fmt_val(desc.field_type, value)
+        except DecodeError as exc:
+            value_repr = f"❌ decode error: {exc}"
+
+        idx_total += 1
+
+        is_nested_message = (expand_nested and sub_payload_bytes is not None
+                             and desc is not None and desc.message_cls is not None)
+        sub_path = (f"{path_prefix}.{field_name}" if path_prefix
+                    else field_name)
+
+        if visible:
+            field_info = {
+                "index": idx_visible,
+                "offset": start,
+                "field_number": field_number,
+                "field_name": field_name,
+                "wire_type": wire_type,
+                "wire_name": _WIRE_NAME.get(wire_type, "?"),
+                "raw_hex": raw_bytes.hex(" "),
+                "value_repr": value_repr,
+                "path": sub_path,
+            }
+            result.fields.append(field_info)
+            out(
+                f"{ind}  [{idx_visible:03d}] offset={start:<6} "
+                f"field={field_number:<4} ({field_name:<20}) "
+                f"wire={wire_type}({_WIRE_NAME.get(wire_type, '?'):<7}) "
+                f"= {value_repr}"
+            )
+            out(f"{ind}           tag={tag_bytes.hex(' '):<20} "
+                f"raw={raw_bytes.hex(' ')}")
+            idx_visible += 1
+
+            if is_nested_message:
+                out(f"{ind}     └─ nested {desc.message_cls.__name__} "
+                    f"({len(sub_payload_bytes)} bytes):")
+                _dump_one_level(
+                    desc.message_cls, sub_payload_bytes, out,
+                    sub_path, indent_level + 1,
+                    only_fields, only_names, only_paths,
+                    result, expand_nested=True,
+                )
+        elif is_nested_message and (only_names is not None or only_paths is not None):
+            _dump_one_level(
+                desc.message_cls, sub_payload_bytes, out,
+                sub_path, indent_level + 1,
+                only_fields, only_names, only_paths,
+                result, expand_nested=True,
+            )
+
+    if indent_level == 0:
+        out("")
+        out(f"解析完成: 共 {idx_total} 个 field, "
+            f"可见 {idx_visible} 个, "
+            f"错误 {len(result.errors)} 个")
+
+
+def dump_data(cls: Type[Message], data: bytes,
+              out: Optional[Callable[[str], None]] = None,
+              only_fields: Optional[Iterable[int]] = None,
+              only_names: Optional[Iterable[str]] = None,
+              only_paths: Optional[Iterable[str]] = None,
+              expand_nested: bool = True,
+              ) -> DumpResult:
+    """按 schema 诊断 dump 一段二进制数据。
+
+    Args:
+        cls: 目标消息类
+        data: 二进制数据
+        out: 可选输出函数，不传则打印到 stdout
+        only_fields: 只看这些字段号
+        only_names: 只看这些字段名
+        only_paths: 只看这些路径 (如 "address.zip_code", "attrs")
+        expand_nested: 是否缩进展开嵌套消息
+    """
+    if out is None:
+        import sys
+        def _print(s):
+            print(s)
+        out = _print
+    ofs = set(only_fields) if only_fields is not None else None
+    ons = set(only_names) if only_names is not None else None
+    ops = set(only_paths) if only_paths is not None else None
+    result = DumpResult(total_bytes=len(data))
+    _dump_one_level(cls, data, out, "", 0, ofs, ons, ops, result,
+                    expand_nested=expand_nested)
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Demo / Tests
+# __main__ 测试
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import sys
+
     passed = 0
     failed = 0
 
-    def check(name: str, cond: Any, detail: str = "") -> None:
+    def check(cond, msg):
         global passed, failed
         if cond:
             passed += 1
-            print(f"  ✅ {name}" + (f" — {detail}" if detail else ""))
+            print(f"  ✅ {msg}")
         else:
             failed += 1
-            print(f"  ❌ {name}" + (f" — {detail}" if detail else ""))
+            print(f"  ❌ {msg}")
 
-    # ==================================================================
-    # [1/8] Schema 兼容检查工具
-    # ==================================================================
-    print("=" * 70)
-    print("[1/8] Schema 版本兼容性检查")
-    print("=" * 70)
+    def section(title):
+        print(f"\n=== {title} ===")
 
-    # ---- 旧版本 Person V1 ----
+    # ============================================================
+    # v1: 基础编码/解码
+    # ============================================================
+    section("v1: 基础 varint / zigzag / tag")
+
+    check(encode_varint(0) == b"\x00", "varint(0)")
+    check(encode_varint(1) == b"\x01", "varint(1)")
+    check(encode_varint(150) == b"\x96\x01", "varint(150)")
+    check(decode_varint(BytesIO(b"\x96\x01")) == 150, "decode varint(150)")
+
+    check(zigzag_encode(0, 32) == 0, "zigzag(0)")
+    check(zigzag_encode(-1, 32) == 1, "zigzag(-1)")
+    check(zigzag_encode(1, 32) == 2, "zigzag(1)")
+    check(zigzag_encode(-2, 32) == 3, "zigzag(-2)")
+    check(zigzag_decode(1, 32) == -1, "de-zigzag(1) = -1")
+    check(zigzag_decode(2, 32) == 1, "de-zigzag(2) = 1")
+
+    check(make_tag(1, 0) == 8, "tag(1, VARINT) = 8")
+    check(parse_tag(8) == (1, 0), "parse(8) = (1, VARINT)")
+
+    section("v1: INT32 负数 round-trip + 边界值")
+    for v in [-1, -2147483648, 2147483647, 0, 1, -2, 42]:
+        enc = encode_varint(_to_unsigned(v, 32))
+        dec = _to_signed(decode_varint(BytesIO(enc)), 32)
+        check(dec == v, f"INT32 round-trip {v}")
+
+    # ============================================================
+    # v2/v3: Schema 定义、嵌套、packed、map
+    # ============================================================
+    section("v2: Schema 类定义 + 基础消息")
+
     @msg_schema
-    class AddressV1(Message):
-        city = Field(1, FieldType.STRING)
+    class Phone(Message):
+        number = Field(1, FieldType.STRING)
+        type = Field(2, FieldType.INT32)
+
+    @msg_schema
+    class Person(Message):
+        name = Field(1, FieldType.STRING)
+        age = Field(2, FieldType.INT32)
+        phones = Field(3, FieldType.MESSAGE, message_cls=Phone, repeated=True)
+        scores = Field(4, FieldType.INT32, repeated=True, packed=True)
+
+    p = Person(name="Alice", age=30,
+               phones=[Phone(number="123", type=1), Phone(number="456", type=2)],
+               scores=[10, 20, -5, 0])
+    data = encode(p)
+    p2 = decode(Person, data)
+    check(p2.name == "Alice", "decode name")
+    check(p2.age == 30, "decode age")
+    check(len(p2.phones) == 2, "decode phones len")
+    check(p2.phones[0].number == "123", "decode phone[0].number")
+    check(p2.phones[1].number == "456", "decode phone[1].number")
+    check(p2.scores == [10, 20, -5, 0], f"decode packed scores = {p2.scores}")
+    check(p == p2, "Person encode/decode equal")
+
+    section("v2: packed + 非 packed 两种写法都能读回")
+    p3 = Person(scores=[1, 2, 3])
+    data3 = encode(p3)
+    p3d = decode(Person, data3)
+    check(p3d.scores == [1, 2, 3], f"packed scores via encode: {p3d.scores}")
+
+    section("v3: map 字段")
+
+    @msg_schema
+    class Config(Message):
+        attrs = Field(1, map=(FieldType.STRING, FieldType.STRING))
+        counts = Field(2, map=(FieldType.STRING, FieldType.INT32))
+
+    c = Config(attrs={"env": "prod", "region": "cn"},
+               counts={"a": 1, "b": 2})
+    cdata = encode(c)
+    c2 = decode(Config, cdata)
+    check(c2.attrs == {"env": "prod", "region": "cn"}, f"map<string,string> = {c2.attrs}")
+    check(c2.counts == {"a": 1, "b": 2}, f"map<string,int32> = {c2.counts}")
+
+    section("v3: varint 溢出 / packed 截断 报错")
+    try:
+        bad = b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x02"
+        decode_varint(BytesIO(bad), "test")
+        check(False, "10-byte overflow varint should fail")
+    except VarintOverflowError:
+        check(True, "10-byte overflow varint raises VarintOverflowError")
+
+    try:
+        partial_packed = encode_varint(make_tag(4, WIRE_LEN)) + encode_varint(3) + b"\x80"
+        decode(Person, partial_packed)
+        check(False, "packed with truncated varint should fail")
+    except TruncatedDataError:
+        check(True, "packed truncated varint raises TruncatedDataError")
+
+    section("v3: schema introspection / IDL")
+    idl = Config.format_schema()
+    check("message Config" in idl, "IDL contains 'message Config'")
+    check("map<STRING, STRING> attrs = 1" in idl, "IDL contains attrs map")
+    check("map<STRING, INT32> counts = 2" in idl, "IDL contains counts map")
+    print("    IDL:\n" + "\n".join(f"      {l}" for l in idl.splitlines()))
+
+    # ============================================================
+    # v4: oneof / required / default / compat / dump basic
+    # ============================================================
+    section("v4: oneof 互斥组")
+
+    @msg_schema
+    class Event(Message):
+        id = Field(1, FieldType.INT64, required=True)
+
+        @msg_schema
+        class Created(Message):
+            user = Field(1, FieldType.STRING)
+
+        @msg_schema
+        class Updated(Message):
+            field = Field(1, FieldType.STRING)
+            value = Field(2, FieldType.STRING)
+
+        created = Field(2, FieldType.MESSAGE, message_cls=Created, oneof="payload")
+        updated = Field(3, FieldType.MESSAGE, message_cls=Updated, oneof="payload")
+
+    ev = Event(id=1, created=Event.Created(user="alice"))
+    check(ev.which_oneof("payload") == "created", "which_oneof -> created")
+    ev_data = encode(ev)
+    ev2 = decode(Event, ev_data)
+    check(ev2.which_oneof("payload") == "created", "decode keeps which_oneof")
+
+    try:
+        bad = Event(id=1)
+        bad._fields_present.add("created")
+        bad._fields_present.add("updated")
+        object.__setattr__(bad, "created", Event.Created(user="x"))
+        object.__setattr__(bad, "updated", Event.Updated(field="y", value="z"))
+        encode(bad)
+        check(False, "oneof both set should fail")
+    except OneofConflictError:
+        check(True, "oneof both set raises OneofConflictError")
+
+    section("v4: required 字段校验")
+    try:
+        encode(Event())  # no id
+        check(False, "missing required should fail")
+    except RequiredFieldError:
+        check(True, "missing required raises RequiredFieldError")
+
+    section("v4: presence 区分 默认值 vs 未出现")
+    ev_empty = decode(Event, encode(Event(id=42)))
+    check(not ev_empty.has_field("created"), "has_field(created) = False when absent")
+    check(ev_empty.has_field("id"), "has_field(id) = True")
+    check(ev_empty.created.user == "", "absent oneof branch reads default empty Message")
+
+    section("v4: 兼容性检查 (基础)")
 
     @msg_schema
     class PersonV1(Message):
-        id = Field(1, FieldType.UINT32, required=True)
-        name = Field(2, FieldType.STRING, required=True)
-        old_score = Field(3, FieldType.SINT32)
-        address = Field(4, FieldType.MESSAGE, message_cls=AddressV1)
-        tags = Field(5, FieldType.STRING, repeated=True)
-
-    # ---- 新版本 Person V2 (典型演进: 删 field、加 field、改号、改 required) ----
-    @msg_schema
-    class AddressV2(Message):
-        city = Field(1, FieldType.STRING)
-        zip_code = Field(2, FieldType.STRING)  # 新增
+        name = Field(1, FieldType.STRING, required=True)
+        age = Field(2, FieldType.INT32)
+        email = Field(3, FieldType.STRING)
+        phones = Field(4, FieldType.STRING, repeated=True)
 
     @msg_schema
     class PersonV2(Message):
-        id = Field(1, FieldType.UINT32, required=True)
-        name = Field(2, FieldType.STRING)            # required → optional
-        score = Field(9, FieldType.SINT32)           # old_score 从 #3 改成新增 #9
-        address = Field(4, FieldType.MESSAGE, message_cls=AddressV2)
-        tags = Field(6, FieldType.STRING, repeated=True)   # ⚠️ tags 同名字段从 #5 改成 #6 → 改号!
-        big_id = Field(8, FieldType.SINT64)          # 新增
-        attributes = Field(10, map=(FieldType.STRING, FieldType.INT32))  # 新增
+        name = Field(1, FieldType.STRING)
+        age = Field(2, FieldType.INT32)
+        tags = Field(6, FieldType.STRING, repeated=True)
+        address = Field(7, FieldType.STRING)
+        phones = Field(5, FieldType.STRING, repeated=True)
 
     report = check_compatibility(PersonV1, PersonV2)
-    print(format_compat_report(report))
-    print()
+    print(f"    overall = {report.overall.name}")
+    for d in report.diffs:
+        print(f"    - {d.change} {d.detail}")
+    check(report.overall == CompatLevel.BREAKING,
+          "PersonV1->V2 overall = BREAKING (tags moved + email removed required)")
+    changes = {d.change for d in report.diffs}
+    check("number_moved" in changes, "detect tags number_moved (renumbered)")
+    check("removed" in changes, "detect removed email")
+    check("added" in changes, "detect added address")
 
-    check("有 BREAKING 级别的改动",
-          report.overall == CompatLevel.BREAKING)
-    diff_changes = {d.change for d in report.diffs}
-    check("检测到 number_moved", "number_moved" in diff_changes)
-    check("检测到 required_changed", "required_changed" in diff_changes)
-    check("检测到 added (big_id / attributes / zip_code)",
-          sum(1 for d in report.diffs if d.change == "added") >= 2)
+    section("v4: dump_data 基础 + 字段号过滤 + 损坏数据")
 
-    # 再做一个 "仅新增字段" 的完全安全场景
-    @msg_schema
-    class FooV1(Message):
-        x = Field(1, FieldType.INT32)
+    dump_result = dump_data(Person, data)
+    check(len(dump_result.fields) > 0, "dump produces fields")
+    check(len(dump_result.errors) == 0, "dump no errors on good data")
 
-    @msg_schema
-    class FooV2(Message):
-        x = Field(1, FieldType.INT32)
-        y = Field(2, FieldType.STRING)
-        z = Field(3, FieldType.INT64, repeated=True, packed=True)
+    dump_filtered = dump_data(Person, data, only_fields={1, 2})
+    check(all(f["field_number"] in (1, 2) for f in dump_filtered.fields),
+          f"only_fields filter works: {[f['field_number'] for f in dump_filtered.fields]}")
 
-    safe_report = check_compatibility(FooV1, FooV2)
-    check("仅新增字段 = SAFE_EXTENSION",
-          safe_report.overall == CompatLevel.SAFE_EXTENSION,
-          f"got {safe_report.overall.name}")
+    # 构造损坏数据: 在末尾追加单独的 \x80 (截断 varint)
+    bad_data = data + b"\x80"
+    dump_bad = dump_data(Person, bad_data)
+    check(len(dump_bad.errors) > 0, f"dump detects error: {dump_bad.errors}")
+    print(f"    errors = {dump_bad.errors}")
 
-    # ==================================================================
-    # [2/8] Oneof 互斥字段
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[2/8] Oneof 互斥字段")
-    print("=" * 70)
+    # ============================================================
+    # v5 新功能测试
+    # ============================================================
+
+    # ---- 1. 路径级兼容性报告: 嵌套消息 + map ----
+    section("v5: 兼容性报告 — 嵌套消息 + map 路径级")
 
     @msg_schema
-    class Result(Message):
-        status = Field(1, FieldType.UINT32)
-        error_msg = Field(10, FieldType.STRING, oneof="payload")
-        ok_body = Field(11, FieldType.BYTES, oneof="payload")
-        count = Field(12, FieldType.SINT64, oneof="payload")
-
-    print("  Result schema:")
-    print("\n".join("    " + l for l in Result.format_schema().split("\n")))
-
-    # 2a) 正常: 只设置一个
-    r_ok = Result(status=200, ok_body=b"hello")
-    check("which_oneof('payload') → 'ok_body'",
-          r_ok.which_oneof("payload") == "ok_body")
-    check("has_field('ok_body') = True", r_ok.has_field("ok_body"))
-    check("has_field('error_msg') = False", not r_ok.has_field("error_msg"))
-    r_ok_bytes = encode(r_ok)
-    r_ok_back = decode(Result, r_ok_bytes)
-    check("encode/decode 单值 round-trip",
-          r_ok_back.status == 200 and r_ok_back.ok_body == b"hello"
-          and r_ok_back.which_oneof("payload") == "ok_body")
-
-    # 2b) 同时设置多个 → encode 时抛 OneofConflictError
-    r_bad = Result(status=500)
-    r_bad.error_msg = "oops"
-    r_bad.set_field_present("error_msg", True)
-    r_bad.count = 999
-    r_bad.set_field_present("count", True)
-    try:
-        encode(r_bad)
-        check("oneof 冲突未抛异常", False, "应抛 OneofConflictError")
-    except OneofConflictError as exc:
-        check("oneof 冲突 → OneofConflictError", True, str(exc))
-
-    # 2c) 构造时只给一个也能 encode (默认值不算 presence)
-    r_empty = Result(status=200)  # oneof 组里都没值
-    empty_bytes = encode(r_empty)
-    check("oneof 全空也能编码 (没 presence)",
-          encode(Result(status=200)) == encode_varint(make_tag(1, WIRE_VARINT)) + encode_varint(200))
-    r_empty_back = decode(Result, empty_bytes)
-    check("which_oneof 空组返回 None",
-          r_empty_back.which_oneof("payload") is None)
-
-    # 2d) 解码老数据里同时出现多个 oneof → 保留最后一个 ("最后写入者胜")
-    mixed = bytearray()
-    # 先 error_msg
-    mixed.extend(encode(Result(status=1, error_msg="first")))
-    # 手工再拼上 count=42
-    mixed.extend(encode_varint(make_tag(12, WIRE_VARINT)))
-    mixed.extend(encode_varint(zigzag_encode(42, 64)))
-    r_mixed = decode(Result, bytes(mixed))
-    check("oneof 同时出现保留最后值 (count=42)",
-          r_mixed.count == 42
-          and r_mixed.which_oneof("payload") == "count",
-          f"count={r_mixed.count}, which={r_mixed.which_oneof('payload')}")
-    check("oneof 最后赢, 前一个 error_msg 没 presence",
-          not r_mixed.has_field("error_msg"))
-
-    # ==================================================================
-    # [3/8] Required + Has Field (区分没出现 vs 默认值)
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[3/8] Required 校验 & has_field presence 追踪")
-    print("=" * 70)
+    class AddressV1(Message):
+        street = Field(1, FieldType.STRING)
+        city = Field(2, FieldType.STRING)
 
     @msg_schema
-    class LoginReq(Message):
-        username = Field(1, FieldType.STRING, required=True)
-        password = Field(2, FieldType.STRING, required=True)
-        remember = Field(3, FieldType.BOOL)           # optional
-        session_ttl = Field(4, FieldType.UINT32)     # 可选, 默认 0
+    class UserV1(Message):
+        name = Field(1, FieldType.STRING)
+        address = Field(2, FieldType.MESSAGE, message_cls=AddressV1)
+        attrs = Field(3, map=(FieldType.STRING, FieldType.INT32))
 
-    # 3a) required 缺失 → encode 失败
-    try:
-        encode(LoginReq())
-        check("required 缺失未抛异常", False, "应抛 RequiredFieldError")
-    except RequiredFieldError as exc:
-        check("required 缺失 → RequiredFieldError", True, str(exc))
-
-    # 3b) 正常填充, 通过
-    req = LoginReq(username="admin", password="secret", remember=False, session_ttl=0)
-    req_bytes = encode(req)
-    check("has_field username/pw = True",
-          req.has_field("username") and req.has_field("password"))
-    check("has_field remember (False) = True (显式 set 的 False 也要记录)",
-          req.has_field("remember"))
-    check("has_field session_ttl (显式 0) = True",
-          req.has_field("session_ttl"))
-    req_back = decode(LoginReq, req_bytes)
-    check("解码后 presence 保留",
-          req_back.has_field("username")
-          and req_back.has_field("password")
-          and req_back.has_field("remember")
-          and req_back.has_field("session_ttl"))
-
-    # 3c) 区分 "字段没出现" vs "字段出现但等于默认值"
     @msg_schema
-    class Simple(Message):
-        a = Field(1, FieldType.INT32)   # 可选, 默认 0
-        b = Field(2, FieldType.STRING)  # 可选, 默认 ""
+    class AddressV2(Message):
+        street = Field(1, FieldType.STRING)
+        city = Field(2, FieldType.STRING)
+        zip_code = Field(3, FieldType.STRING)
 
-    only_a = Simple(a=0)       # 显式 a=0
-    only_a_bytes = encode(only_a)
-    back_only_a = decode(Simple, only_a_bytes)
-    check("显式 0 → has_field(a)=True", back_only_a.has_field("a"))
-    check("字段 b 没出现 → has_field(b)=False", not back_only_a.has_field("b"))
-    check("b 的值仍是默认空串", back_only_a.b == "")
+    @msg_schema
+    class UserV2(Message):
+        name = Field(1, FieldType.STRING)
+        address = Field(2, FieldType.MESSAGE, message_cls=AddressV2)
+        attrs = Field(3, map=(FieldType.STRING, FieldType.STRING))
 
-    # 3d) clear_field
-    s = Simple(a=5, b="hello")
-    s.clear_field("a")
-    check("clear_field → 值为默认 0", s.a == 0)
-    check("clear_field → presence 消失", not s.has_field("a"))
+    r5 = check_compatibility(UserV1, UserV2)
+    print(f"    overall = {r5.overall.name}")
+    for d in r5.diffs:
+        print(f"    - {d.level.name} {d.change}  {d.detail}")
+    paths = {d.path for d in r5.diffs}
+    check("address.zip_code" in paths, "检测到嵌套路径 address.zip_code 新增")
+    check("attrs<value>" in paths, "检测到 map value 类型变化 attrs<value>")
+    check(r5.overall == CompatLevel.BREAKING,
+          "map value 类型变化为 BREAKING")
+    print("  " + format_compat_report(r5).replace("\n", "\n  "))
 
-    # ==================================================================
-    # [4/8] dump_data 升级: 损坏定位 + only_fields 过滤
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[4/8] dump_data 升级: 损坏定位 & 过滤")
-    print("=" * 70)
+    # ---- 2. oneof 解码重置分支为默认值 + 重新赋值 + 清空 ----
+    section("v5: oneof 语义 — 解码重置默认值 / 重新赋值 / 清空编码")
+
+    # 构造"老数据"：同时编码 created 和 updated (模拟老版本无序编码)
+    ev_multi = Event(id=99)
+    ev_multi.created = Event.Created(user="first")
+    created_payload = encode(Event.Created(user="first"), validate=False)
+    raw_created = (encode_varint(make_tag(2, WIRE_LEN))
+                   + encode_varint(len(created_payload))
+                   + created_payload)
+    updated_payload = encode(Event.Updated(field="status", value="ok"), validate=False)
+    raw_updated = (encode_varint(make_tag(3, WIRE_LEN))
+                   + encode_varint(len(updated_payload))
+                   + updated_payload)
+    raw_id = encode_varint(make_tag(1, WIRE_VARINT)) + encode_varint(99)
+    old_bytes = raw_id + raw_created + raw_updated  # updated 后出现，应获胜
+
+    ev_decoded = decode(Event, old_bytes)
+    check(ev_decoded.which_oneof("payload") == "updated",
+          f"解码后 which_oneof = updated (最后写入者胜)")
+    check(not ev_decoded.has_field("created"),
+          "解码后 created has_field = False")
+    # 核心: created 对象里的值应该被重置为默认空值
+    check(ev_decoded.created.user == "",
+          f"解码后 created.user 被重置为默认空串, 实际 = {ev_decoded.created.user!r}")
+    check(ev_decoded.updated.field == "status",
+          f"解码后 updated.field = status")
+
+    # 重新赋值: 切到另一个分支
+    ev_decoded.created = Event.Created(user="new_user")
+    check(ev_decoded.which_oneof("payload") == "created",
+          "重新赋值后 which_oneof -> created")
+    check(not ev_decoded.has_field("updated"),
+          "重新赋值后 updated has_field = False")
+    check(ev_decoded.updated.field == "",
+          f"重新赋值后 updated.field 重置为空, 实际 = {ev_decoded.updated.field!r}")
+    reenc = encode(ev_decoded)
+    redec = decode(Event, reenc)
+    check(redec.which_oneof("payload") == "created",
+          "重新编码后 which_oneof = created")
+    check(redec.created.user == "new_user",
+          f"重新编码后 created.user = new_user")
+
+    # 清空分支: set_field_present False
+    ev_decoded.set_field_present("created", False)
+    check(ev_decoded.which_oneof("payload") is None,
+          "清空 created 后 which_oneof = None")
+    check(ev_decoded.created.user == "",
+          f"清空后 created.user 重置为空")
+    check(not ev_decoded.has_field("created"),
+          "清空后 has_field(created) = False")
+    empty_enc = encode(ev_decoded)
+    empty_dec = decode(Event, empty_enc)
+    check(empty_dec.which_oneof("payload") is None,
+          "清空后编码再解码: which_oneof = None")
+    check(not empty_dec.has_field("created"), "清空后编码: created absent")
+    check(not empty_dec.has_field("updated"), "清空后编码: updated absent")
+
+    # clear_field API
+    ev3 = Event(id=1, created=Event.Created(user="x"))
+    ev3.clear_field("created")
+    check(not ev3.has_field("created"), "clear_field: has_field False")
+    check(ev3.which_oneof("payload") is None, "clear_field: which_oneof None")
+
+    # ---- 3. Schema 迁移辅助 ----
+    section("v5: Schema 迁移辅助 — 缺失 required + 默认值填充")
+
+    @msg_schema
+    class OldUser(Message):
+        name = Field(1, FieldType.STRING)
+
+    @msg_schema
+    class NewUser(Message):
+        name = Field(1, FieldType.STRING)
+        age = Field(2, FieldType.INT32, required=True)
+        nickname = Field(3, FieldType.STRING)
+
+        @msg_schema
+        class Addr(Message):
+            city = Field(1, FieldType.STRING, required=True)
+            zip_code = Field(2, FieldType.STRING)
+
+        address = Field(4, FieldType.MESSAGE, message_cls=Addr)
+        tags = Field(5, FieldType.STRING, repeated=True)
+
+    old_u = OldUser(name="Alice")
+    old_u_bytes = encode(old_u)
+
+    mig = try_migrate(old_u_bytes, NewUser)
+    print("  " + format_migration_report(mig).replace("\n", "\n  "))
+    check(mig.decoded is not None, "迁移解码成功")
+    missing = set(mig.missing_required())
+    check("age" in missing, f"检测到缺失 required age: missing={missing}")
+    check("address.city" in missing,
+          f"检测到嵌套缺失 required address.city: missing={missing}")
+    defaults = set(mig.default_filled())
+    check("nickname" in defaults, f"检测到默认值填充 nickname: defaults={defaults}")
+    check("address" in defaults, "检测到默认值填充 address (嵌套消息)")
+    check("tags" in defaults, "检测到默认值填充 tags (repeated)")
+
+    # ---- 4. dump_data: 按字段名/路径过滤 + 嵌套缩进 + 损坏恢复后续可读 ----
+    section("v5: dump_data — 字段名/路径过滤 + 嵌套缩进 + 损坏恢复")
+
+    # 构造嵌套复杂数据
+    @msg_schema
+    class FullAddr(Message):
+        street = Field(1, FieldType.STRING)
+        city = Field(2, FieldType.STRING)
+        zip = Field(3, FieldType.STRING)
 
     @msg_schema
     class FullPerson(Message):
-        id = Field(1, FieldType.UINT32)
-        name = Field(2, FieldType.STRING)
-        score = Field(3, FieldType.SINT32)
-        scores = Field(9, FieldType.INT32, repeated=True, packed=True)
-        attributes = Field(10, map=(FieldType.STRING, FieldType.INT32))
-        str_map = Field(11, map=(FieldType.STRING, FieldType.STRING))
+        name = Field(1, FieldType.STRING)
+        age = Field(2, FieldType.INT32)
+        addr = Field(3, FieldType.MESSAGE, message_cls=FullAddr)
+        score = Field(4, FieldType.INT32)
 
-    fp = FullPerson(
-        id=999, name="Charlie", score=5,
-        scores=[1, 2, 3],
-        attributes={"a": 1},
-        str_map={"x": "y"},
-    )
-    good_bytes = encode(fp)
+    fp = FullPerson(name="Bob", age=25,
+                    addr=FullAddr(street="Main St", city="NYC", zip="10001"),
+                    score=99)
+    fp_data = encode(fp)
 
-    # 4a) 只看字段 1 和 10
-    print("  --- dump, only_fields={1, 10}: ---")
-    captured: List[str] = []
-    dump_data(FullPerson, good_bytes,
-              out=lambda s: captured.append(s),
-              only_fields={1, 10})
-    filt_out = "\n".join(captured)
-    check("only_fields 过滤: 出现 id", "field=1" in filt_out)
-    check("only_fields 过滤: 出现 attributes", "field=10" in filt_out)
-    check("only_fields 过滤: name(2) 不出现", "field=2" not in filt_out)
+    print("    --- 按字段名过滤 (只看 name, city) ---")
+    lines_buf = []
+    dump_data(FullPerson, fp_data, out=lines_buf.append,
+              only_names={"name", "city"})
+    for l in lines_buf:
+        print(f"    {l}")
+    visible_names = {f["field_name"] for f in lines_buf
+                     if isinstance(f, dict) and "field_name" in f}
+    # 更简单: 检查 lines_buf 里输出了 name 和 city
+    name_found = any("name" in l and "Bob" in l for l in lines_buf)
+    city_found = any("city" in l and "NYC" in l for l in lines_buf)
+    check(name_found and city_found,
+          f"按字段名过滤: name={name_found}, city={city_found}")
 
-    # 4b) 损坏数据: 在末尾加 1 个 MSB=1 的 varint 字节 (半字节截断)
-    damaged = good_bytes + b"\x80"  # 最后一个 varint 只有 MSB=1, 没有后续 — 明确截断
+    print("\n    --- 按路径过滤 (只看 addr.zip) ---")
+    lines_buf2 = []
+    dump_data(FullPerson, fp_data, out=lines_buf2.append,
+              only_paths={"addr", "addr.zip"})
+    for l in lines_buf2:
+        print(f"    {l}")
+    zip_found = any("zip" in l and "10001" in l for l in lines_buf2)
+    check(zip_found, f"按路径过滤 addr.zip 可见: {zip_found}")
 
-    print()
-    print("  --- dump 损坏数据 (含定位): ---")
-    captured2: List[str] = []
-    result = dump_data(FullPerson, bytes(damaged), out=lambda s: captured2.append(s))
-    dmg_out = "\n".join(captured2)
-    print("\n".join("    " + l for l in captured2))
-    check("dump 损坏数据: 检测到 error_at_offset",
-          result.error_at_offset is not None)
-    check("dump 损坏数据: 有错误信息",
-          result.error_message is not None)
-    check("损坏输出含 ERROR", "ERROR" in dmg_out)
+    # 嵌套缩进展示
+    print("\n    --- 嵌套消息缩进展示 ---")
+    lines_buf3 = []
+    dump_data(FullPerson, fp_data, out=lines_buf3.append, expand_nested=True)
+    indent_lines = [l for l in lines_buf3 if l.startswith("      ") or "      [" in l]
+    has_nested = any("nested FullAddr" in l for l in lines_buf3)
+    check(has_nested, f"检测到 nested FullAddr 标题行")
 
-    # ==================================================================
-    # [5/8] 旧功能回归 — 整数边界 + packed/varint + map + 旧 schema
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[5/8] 回归: 整数边界 & packed & map & 向前兼容")
-    print("=" * 70)
+    # 损坏恢复: 中间插损坏字节，后续字段仍能解析
+    # 构造: name(1) + [LEN tag + 超大长度 (不完整)] + age(2) + addr(3) + score(4)
+    name_bytes = encode_varint(make_tag(1, WIRE_LEN)) + encode_varint(3) + b"Bob"
+    age_bytes = encode_varint(make_tag(2, WIRE_VARINT)) + encode_varint(25)
+    score_bytes = encode_varint(make_tag(4, WIRE_VARINT)) + encode_varint(99)
+    # LEN field with tag(99, LEN) + length 99999 — way more than remaining buffer
+    corrupt_bytes = encode_varint(make_tag(99, WIRE_LEN)) + encode_varint(999999)
+    corrupt_middle = name_bytes + corrupt_bytes + age_bytes + score_bytes
 
-    edge_cases = {
-        "min_int32": -2**31,
-        "max_int32": 2**31 - 1,
-        "neg_one": -1,
-    }
-    p = FullPerson(
-        attributes=edge_cases,
-        scores=[-1, -2**31, 2**31 - 1, 0],
-    )
-    p_bytes = encode(p)
-    p_back = decode(FullPerson, p_bytes)
-    check("map 边界值 min_int32", p_back.attributes["min_int32"] == -2**31)
-    check("map 边界值 max_int32", p_back.attributes["max_int32"] == 2**31 - 1)
-    check("packed int32 边界值",
-          p_back.scores == [-1, -2**31, 2**31 - 1, 0])
+    print("\n    --- 损坏数据恢复解析 ---")
+    lines_buf4 = []
+    res_corrupt = dump_data(FullPerson, corrupt_middle, out=lines_buf4.append)
+    for l in lines_buf4:
+        print(f"    {l}")
+    check(len(res_corrupt.errors) >= 1, f"检测到错误: {len(res_corrupt.errors)}")
+    # name 应该在损坏前被解析
+    name_parsed = any("name" in l and "Bob" in l for l in lines_buf4)
+    # age 和 score 应该在损坏恢复后被解析
+    age_parsed = any("age" in l and "25" in l for l in lines_buf4)
+    score_parsed = any("score" in l and "99" in l for l in lines_buf4)
+    check(name_parsed, f"损坏前 name 被解析: {name_parsed}")
+    check(age_parsed, f"恢复后 age 被解析: {age_parsed}")
+    check(score_parsed, f"恢复后 score 被解析: {score_parsed}")
 
-    # 老版本不认识 map 和 scores.packed → 跳过
-    @msg_schema
-    class OldPerson(Message):
-        id = Field(1, FieldType.UINT32)
-        name = Field(2, FieldType.STRING)
-
-    old_decoded = decode(OldPerson, encode(fp))
-    check("老版本读 id", old_decoded.id == 999)
-    check("老版本读 name", old_decoded.name == "Charlie")
-
-    # ==================================================================
-    # [6/8] 回归: packed 半字节 & 10 字节越界
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[6/8] 回归: packed 半字节 & 10 字节越界")
-    print("=" * 70)
-
-    @msg_schema
-    class PackedI32(Message):
-        values = Field(1, FieldType.INT32, repeated=True, packed=True)
-
-    bad_packed_body = bytearray()
-    bad_packed_body.extend(encode_varint(1))
-    bad_packed_body.append(0x80)  # 半个 varint
-    bad_data = (encode_varint(make_tag(1, WIRE_LEN))
-                + encode_varint(len(bad_packed_body))
-                + bytes(bad_packed_body))
-    try:
-        decode(PackedI32, bad_data)
-        ok = False
-    except TruncatedDataError:
-        ok = True
-    check("packed 半字节截断报错", ok)
-
-    # 10 字节合法 / 非法
-    v1 = decode_varint(BytesIO(b"\xff" * 9 + b"\x01"), "legal")
-    check("10 字节合法 varint (all ones)", v1 == 0xFFFFFFFFFFFFFFFF)
-    v2 = decode_varint(BytesIO(b"\x80" * 9 + b"\x01"), "legal63")
-    check("10 字节合法 varint (bit63 only)", v2 == 2**63)
-    try:
-        decode_varint(BytesIO(b"\xff" * 9 + b"\x03"), "illegal")
-        ok = False
-    except VarintOverflowError:
-        ok = True
-    check("10 字节 varint 高 2 位非法报错", ok)
-    try:
-        decode_varint(BytesIO(b"\x80" * 11 + b"\x00"), "toolong")
-        ok = False
-    except VarintOverflowError:
-        ok = True
-    check(">10 字节 varint 报错", ok)
-
-    # ==================================================================
-    # [7/8] 回归: 基础字段 & format_schema 含 oneof
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[7/8] 回归: format_schema 含 oneof / map / required")
-    print("=" * 70)
-
-    @msg_schema
-    class FullFeatured(Message):
-        uuid = Field(1, FieldType.UINT64, required=True)
-        data = Field(2, FieldType.STRING)
-        flag_a = Field(3, FieldType.BOOL, oneof="which")
-        flag_b = Field(4, FieldType.INT32, oneof="which")
-        attrs = Field(5, map=(FieldType.STRING, FieldType.BOOL))
-        nums = Field(6, FieldType.FIXED32, repeated=True, packed=True)
-
-    schema_text = FullFeatured.format_schema()
-    print("\n".join("    " + l for l in schema_text.split("\n")))
-    check("format_schema 含 'required'", "required" in schema_text)
-    check("format_schema 含 'oneof which'", "oneof which" in schema_text)
-    check("format_schema 含 'map<STRING, BOOL>'", "map<STRING, BOOL>" in schema_text)
-    check("format_schema 含 'repeated packed FIXED32'",
-          "repeated packed FIXED32" in schema_text)
-
-    # ==================================================================
-    # [8/8] 端到端: 带 required + oneof + map + packed 完整 round-trip
-    # ==================================================================
-    print()
-    print("=" * 70)
-    print("[8/8] 端到端: 全特性混合 round-trip")
-    print("=" * 70)
-
-    full = FullFeatured(
-        uuid=0xDEADBEEF,
-        data="ok",
-        flag_b=42,  # oneof 里只选这个
-        attrs={"foo": True, "bar": False},
-        nums=[0xFFFFFFFF, 0, 1],
-    )
-    check("encode 前 validate 通过", True)  # 没抛异常就是通过
-    full_bytes = encode(full)
-    full_back = decode(FullFeatured, full_bytes)
-    check("uuid 还原", full_back.uuid == 0xDEADBEEF)
-    check("data 还原", full_back.data == "ok")
-    check("which_oneof → flag_b", full_back.which_oneof("which") == "flag_b")
-    check("oneof 值 flag_b", full_back.flag_b == 42)
-    check("map attrs 还原", full_back.attrs == {"foo": True, "bar": False})
-    check("packed fixed32 还原", full_back.nums == [0xFFFFFFFF, 0, 1])
-    check("required + presence", full_back.has_field("uuid"))
-
-    print()
-    print("=" * 70)
-    print(f"  总计: {passed} 通过, {failed} 失败")
-    print("=" * 70)
-    if failed:
-        raise SystemExit(1)
-    print("🎉 全部通过!")
+    # ============================================================
+    # 汇总
+    # ============================================================
+    print(f"\n{'=' * 60}")
+    print(f"总计: 通过 {passed}, 失败 {failed}")
+    if failed > 0:
+        sys.exit(1)
+    sys.exit(0)
